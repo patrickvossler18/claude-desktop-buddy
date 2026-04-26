@@ -143,6 +143,28 @@ class BleTransport:
                 log(f"[ble] connecting to {target.name} ({target.address})")
                 async with BleakClient(target.address) as client:
                     self.client = client
+                    # The firmware's NUS characteristics are encrypted-only
+                    # (LE Secure Connections). On macOS, just subscribing to
+                    # the TX char isn't always enough to make CoreBluetooth
+                    # pop the passkey dialog — explicitly request pairing
+                    # first. On backends where pair() is a no-op or
+                    # unimplemented, it's harmless.
+                    try:
+                        await client.pair()
+                        log("[ble] pair() returned")
+                    except NotImplementedError:
+                        log("[ble] pair() not implemented on this backend; relying on auto-pair")
+                    except Exception as e:
+                        log(f"[ble] pair() raised: {e}")
+                    # First encrypted access: an empty write to RX. If the
+                    # link still isn't bonded, this forces CoreBluetooth to
+                    # initiate pairing now (and surface the passkey dialog),
+                    # not when we later subscribe.
+                    try:
+                        await client.write_gatt_char(NUS_RX_CHAR, b"\n", response=False)
+                    except Exception as e:
+                        log(f"[ble] initial write failed (pairing in progress?): {e}")
+                        await asyncio.sleep(3)
                     await client.start_notify(NUS_TX_CHAR, on_notify)
                     self.connected.set()
                     log("[ble] connected and subscribed")

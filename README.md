@@ -1,5 +1,13 @@
 # claude-desktop-buddy
 
+> **Fork note:** This is a fork of
+> [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
+> that adds a **Claude Code (CLI)-only bridge** — no desktop app
+> required. Driven by Claude Code's hook system. The firmware and BLE
+> wire protocol are unchanged from upstream, so a stick paired with the
+> desktop app still works here, and vice versa. See
+> [Claude Code support](#claude-code-support-this-fork) below.
+
 Claude for macOS and Windows can connect Claude Cowork and Claude Code to
 maker devices over BLE, so developers and makers can build hardware that
 displays permission prompts, recent messages, and other interactions. We've
@@ -65,6 +73,150 @@ If discovery isn't finding the stick:
 
 - Make sure it's awake (any button press)
 - Check the stick's settings menu → bluetooth is on
+
+## Claude Code support (this fork)
+
+The upstream bridge runs inside the Claude desktop apps. This fork adds
+an alternate bridge that runs as a small daemon alongside Claude Code,
+fed by Claude Code's hook system. Same buddy, same display, same
+A=approve / B=deny — driven by the CLI instead of the GUI.
+
+```
+Claude Code session            cc_buddy_daemon              M5StickC
+┌──────────────────┐ ──hook──► ┌──────────────┐ ──serial/BLE──► ┌──┐
+│   Stop hook      │           │ owns the     │                 │  │
+│   PreToolUse hook│ ◄──reply─ │ transport    │ ◄──button──────│  │
+└──────────────────┘           └──────────────┘                 └──┘
+```
+
+The pieces:
+
+- **`tools/cc_buddy_daemon.py`** — long-running process. Owns the USB
+  serial or BLE link, sends a 10s keepalive so the stick stays
+  "connected", aggregates `output_tokens` across sessions, and
+  serializes permission requests so the firmware sees one prompt at a
+  time.
+- **`tools/cc_stop_hook.py`** — fires after every assistant turn. Reads
+  the session's transcript JSONL, sums tokens (deduped by message id),
+  pulls recent tool calls and user prompts into a heartbeat, sends to
+  the daemon.
+- **`tools/cc_pretool_hook.py`** — fires before every tool call. Asks
+  the daemon for an approval, blocks for the device's response, returns
+  Claude Code's `permissionDecision` JSON. On daemon-down, timeout, or
+  bypass-mode sessions, exits silently so Claude Code's normal terminal
+  prompt takes over — the buddy is additive, never a hard dependency.
+- **`tools/install.sh`** — idempotent installer.
+
+### Install
+
+```bash
+git clone https://github.com/patrickvossler18/claude-desktop-buddy
+cd claude-desktop-buddy
+./tools/install.sh
+```
+
+The installer:
+
+1. Creates a Python venv at `~/.local/share/cc-buddy/venv`.
+2. Installs `pyserial` and `bleak` into it.
+3. Generates wrapper scripts in `~/.local/share/cc-buddy/bin/` that
+   invoke the venv python with the hook scripts.
+4. Adds `Stop` and `PreToolUse` hook entries to
+   `~/.claude/settings.json` (merging — won't clobber other hooks or
+   settings).
+
+Override the install location with `CC_BUDDY_HOME=/some/path`. Override
+the Python interpreter used to create the venv with
+`CC_BUDDY_PYTHON=/path/to/python3` (defaults to whatever `python3` is on
+PATH; needs 3.10+).
+
+### Use
+
+Start the daemon (leave it running in a terminal):
+
+```bash
+~/.local/share/cc-buddy/bin/cc_buddy_daemon
+```
+
+To run over BLE instead of USB (unplug the cable from the stick first):
+
+```bash
+BUDDY_TRANSPORT=ble ~/.local/share/cc-buddy/bin/cc_buddy_daemon
+```
+
+#### One-time BLE pairing on macOS
+
+The firmware's NUS characteristics are encrypted-only (LE Secure
+Connections), so the very first connection from a given laptop has to
+pair. The daemon will trigger a pairing request on first run, and
+*usually* macOS surfaces the passkey dialog automatically — but for
+CLI-launched processes it sometimes doesn't (the dialog is normally
+triggered by foreground signed GUI apps). If `tail -f /tmp/cc_buddy.log`
+shows the daemon stuck repeating `[ble] error: Encryption is
+insufficient`, follow these one-time steps:
+
+1. **Stop the daemon** (Ctrl-C). The hung connection blocks the
+   workaround app.
+2. Install **LightBlue** (free, App Store — Punch Through's BLE
+   explorer) or any other foreground macOS BLE tool.
+3. Open it, find **`Claude-XXXX`** in the device list, tap **Connect**.
+4. macOS pops the passkey dialog — type the 6-digit number on the
+   stick.
+5. Once it shows "Connected", **quit the app** (it holds the BLE link
+   exclusively).
+6. Restart the daemon. The OS-level bond is now stored, and the daemon
+   reconnects silently from here on.
+
+Subsequent connects (sleep, reboot, daemon restart) all reuse the
+stored bond — no dialog, no app. You only repeat this dance per
+laptop, or if you factory-reset the stick.
+
+If the macOS Bluetooth pane (System Settings → Bluetooth) doesn't show
+the stick, that's normal — BLE-only peripherals without a standard
+profile don't appear there even when paired.
+
+Then start a `claude` session as usual. The next assistant turn ticks
+the stick (heartbeat, token count, recent activity). The next tool call
+shows a permission prompt on the screen — **A** allows it, **B** denies.
+Timeout is 30 seconds, after which Claude Code falls back to its normal
+terminal prompt.
+
+Tail the unified log to see what's happening:
+
+```bash
+tail -f /tmp/cc_buddy.log
+```
+
+### Configuration
+
+All of these are optional environment variables:
+
+| Variable           | Default                  | Purpose                                              |
+| ------------------ | ------------------------ | ---------------------------------------------------- |
+| `BUDDY_TRANSPORT`  | auto (serial → BLE)      | Force `serial` or `ble`.                             |
+| `BUDDY_PORT`       | first `/dev/cu.usbserial-*` | Explicit serial device path.                      |
+| `BUDDY_BLE_NAME`   | `Claude`                 | BLE advertising-name prefix to match.                |
+| `BUDDY_SOCK`       | `/tmp/cc_buddy.sock`     | Unix socket the hooks talk to the daemon on.        |
+| `BUDDY_LOG`        | `/tmp/cc_buddy.log`      | Unified daemon + hook log path.                     |
+
+### Multi-laptop
+
+Hooks fire in the Claude Code process on whichever machine you're using,
+so each laptop needs its own `./tools/install.sh`. The stick itself is
+portable — pair it once per laptop over BLE and it'll roam between them.
+
+### Permission-mode handling
+
+The PreToolUse hook respects Claude Code's permission modes: if a
+session is running with `bypassPermissions` or `acceptEdits`, the hook
+exits immediately without prompting the device. The buddy is for
+sessions where you've explicitly opted *in* to per-tool approvals.
+
+### Firmware
+
+Identical to upstream. If you've already flashed your stick for the
+desktop app, you don't need to reflash. If you're starting fresh, follow
+the **Hardware** and **Flashing** sections above.
 
 ## Controls
 
